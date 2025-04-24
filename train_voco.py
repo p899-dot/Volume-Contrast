@@ -1,0 +1,214 @@
+import argparse
+import os
+import logging
+import torch
+import torch.distributed as dist
+import torch.optim as optim
+from models.voco_head import VoCoHead
+from torch.cuda.amp import GradScaler, autocast
+from utils.data_loader import get_data_loaders
+from utils.utils import init_log
+import platform
+
+# Only import resource module on Unix-like systems
+if platform.system() != 'Windows':
+    import resource
+    rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (8192, rlimit[1]))
+
+def save_checkpoint(state, is_best, checkpoint_dir):
+    """Save checkpoint to disk"""
+    filename = os.path.join(checkpoint_dir, 'checkpoint.pth')
+    torch.save(state, filename)
+    if is_best:
+        best_filename = os.path.join(checkpoint_dir, 'model_best.pth')
+        torch.save(state, best_filename)
+
+def train(args, model, train_loader, val_loader, optimizer, scheduler, scaler, start_epoch=0, initial_global_step=0):
+    """Train the model"""
+    model.train()
+    val_best = float('inf')
+    global_step = initial_global_step
+    
+    for epoch in range(start_epoch, args.epochs):
+        print(f"Starting epoch {epoch+1}/{args.epochs}")
+        print(f"Current lr: {optimizer.param_groups[0]['lr']:.6f}")
+        print(f"Global step: {global_step}")
+        
+        running_loss = 0.0
+        for i, batch in enumerate(train_loader):
+            # Zero gradients
+            optimizer.zero_grad(set_to_none=True)
+            
+            # Forward pass
+            with torch.cuda.amp.autocast(enabled=not args.noamp):
+                loss = model(batch)
+            
+            # Backward pass
+            if not args.noamp:
+                scaler.scale(loss).backward()
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            
+            # Update learning rate
+            scheduler.step(epoch + i / len(train_loader))
+            
+            running_loss += loss.item()
+            global_step += 1
+            
+            # Log progress
+            if i % 10 == 0:
+                avg_loss = running_loss / (i + 1)
+                print(f"Step [{global_step}] Epoch [{epoch+1}/{args.epochs}][{i}/{len(train_loader)}] "
+                      f"Loss: {avg_loss:.4f} LR: {optimizer.param_groups[0]['lr']:.6f}")
+        
+        # Validation
+        if epoch % args.eval_num == 0:
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    with torch.cuda.amp.autocast(enabled=not args.noamp):
+                        loss = model(val_batch)
+                    val_loss += loss.item()
+            
+            val_loss /= len(val_loader)
+            print(f"Step [{global_step}] Validation Loss: {val_loss:.4f}")
+            
+            # Save checkpoint if validation improves
+            if val_loss < val_best:
+                val_best = val_loss
+                save_checkpoint({
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'val_loss': val_best,
+                    'args': args,
+                }, True, args.logdir)
+            
+            model.train()
+        
+        # Save regular checkpoint
+        if (epoch + 1) % 10 == 0:
+            save_checkpoint({
+                'epoch': epoch,
+                'global_step': global_step,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'val_loss': val_best,
+                'args': args,
+            }, False, args.logdir)
+    
+    return val_best, global_step
+
+def main():
+    parser = argparse.ArgumentParser(description="PyTorch Training")
+    parser.add_argument("--logdir", default="logs", type=str, help="directory to save logs")
+    parser.add_argument("--data_dir", default="VoCo-code/dataset for VoCo/BTCV", type=str, help="path to dataset directory")
+    parser.add_argument("--epochs", default=100, type=int, help="number of training epochs")
+    parser.add_argument("--eval_num", default=1, type=int, help="evaluation frequency")
+    parser.add_argument("--warmup_steps", default=1000, type=int, help="warmup steps")
+    parser.add_argument("--in_channels", default=1, type=int, help="number of input channels")
+    parser.add_argument("--feature_size", default=16, type=int, help="embedding size")
+    parser.add_argument("--dropout_path_rate", default=0.0, type=float, help="drop path rate")
+    parser.add_argument("--use_checkpoint", default=True, help="use gradient checkpointing to save memory")
+    parser.add_argument("--spatial_dims", default=3, type=int, help="spatial dimension of input data")
+    parser.add_argument("--a_min", default=-175.0, type=float, help="a_min in ScaleIntensityRanged")
+    parser.add_argument("--a_max", default=250.0, type=float, help="a_max in ScaleIntensityRanged")
+    parser.add_argument("--b_min", default=0.0, type=float, help="b_min in ScaleIntensityRanged")
+    parser.add_argument("--b_max", default=1.0, type=float, help="b_max in ScaleIntensityRanged")
+    parser.add_argument("--roi_x", default=64, type=int, help="roi size in x direction")
+    parser.add_argument("--roi_y", default=64, type=int, help="roi size in y direction")
+    parser.add_argument("--roi_z", default=64, type=int, help="roi size in z direction")
+    parser.add_argument("--batch_size", default=4, type=int, help="number of batch size")
+    parser.add_argument("--lr", default=1e-4, type=float, help="learning rate")
+    parser.add_argument("--decay", default=0.1, type=float, help="decay rate")
+    parser.add_argument("--momentum", default=0.9, type=float, help="momentum")
+    parser.add_argument("--opt", default="sgd", type=str, help="optimization algorithm")
+    parser.add_argument("--resume", default=None, type=str, help="resume training")
+    parser.add_argument("--local_rank", type=int, default=0, help="local rank")
+    parser.add_argument("--noamp", default=False, type=bool, help="disable AMP training")
+    parser.add_argument("--dist-url", default="env://", help="url used to set up distributed training")
+
+    args = parser.parse_args()
+    
+    # Set data directory and logdir
+    args.data_dir = os.path.abspath(args.data_dir)
+    args.logdir = os.path.abspath(args.logdir)
+    
+    print(f"Data directory: {args.data_dir}")
+    print(f"Log directory: {args.logdir}")
+    
+    os.makedirs(args.logdir, exist_ok=True)
+
+    # Setup logging
+    logger = init_log('global', logging.INFO)
+    logger.propagate = 0
+
+    # Initialize model
+    model = VoCoHead(args)
+    model.cuda()
+
+    # Initialize optimizer
+    optimizer = optim.SGD(
+        params=model.parameters(),
+        lr=args.lr,
+        momentum=args.momentum,
+        weight_decay=args.decay,
+        nesterov=True
+    )
+
+    # Initialize scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=10,
+        T_mult=2,
+        eta_min=1e-6
+    )
+
+    # Initialize AMP scaler
+    scaler = GradScaler(enabled=not args.noamp)
+
+    # Load checkpoint if resuming
+    start_epoch = 0
+    global_step = 0
+    val_best = float('inf')
+    
+    if args.resume:
+        print('Resuming from checkpoint:', args.resume)
+        try:
+            checkpoint = torch.load(args.resume)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint.get('epoch', -1) + 1
+            global_step = checkpoint.get('global_step', 0)
+            val_best = checkpoint.get('val_loss', float('inf'))
+            
+            print(f'Successfully resumed from epoch {start_epoch} (global step {global_step})')
+            print(f'Previous best validation loss: {val_best:.4f}')
+        except Exception as e:
+            print('Failed to load checkpoint:', e)
+            print('Starting from scratch...')
+
+    # Get data loaders
+    train_loader, val_loader = get_data_loaders(args)
+
+    # Train the model
+    val_best, final_global_step = train(args, model, train_loader, val_loader, optimizer, scheduler, scaler, start_epoch, global_step)
+    print(f'Training completed. Best validation loss: {val_best:.4f}')
+    print(f'Final global step: {final_global_step}')
+
+if __name__ == "__main__":
+    main() 
